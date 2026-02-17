@@ -63,6 +63,7 @@ const generateReply = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Client ID and message are required' });
         }
 
+        // CRITICAL: Verify client belongs to authenticated user
         const client = await Client.findOne({ 
             _id: clientId, 
             userId: req.user._id 
@@ -76,8 +77,8 @@ const generateReply = async (req, res) => {
             return res.status(400).json({ success: false, message: 'AI is disabled for this client' });
         }
 
-        // Use AI reply service
-        const reply = await generateAIReply(clientId, incomingMessage, senderName);
+        // CRITICAL: Pass accountId to AI service for validation
+        const reply = await generateAIReply(clientId, incomingMessage, senderName, req.user._id.toString());
 
         // Update client stats
         client.totalReplies += 1;
@@ -134,7 +135,9 @@ const handleIncomingMessage = async (req, res) => {
             idempotencyKey: req.body.idempotencyKey
         });
 
-        const { clientId, accountId, conversationId, senderName, incomingText, idempotencyKey } = req.body;
+        // CRITICAL: Use validated accountId from middleware
+        const accountId = req.verifiedAccountId || req.validatedAccountId || req.body.accountId;
+        const { clientId, conversationId, senderName, incomingText, idempotencyKey } = req.body;
 
         if (!clientId || !accountId || !conversationId || !senderName || !incomingText || !idempotencyKey) {
             console.error('❌ [Incoming Message] Missing required fields:', {
@@ -151,13 +154,39 @@ const handleIncomingMessage = async (req, res) => {
             });
         }
 
-        // Verify client belongs to account
+        // CRITICAL: Validate ObjectId formats to prevent injection
+        if (!require('mongoose').Types.ObjectId.isValid(accountId)) {
+            console.error('❌ [Incoming Message] Invalid accountId format:', accountId);
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Invalid accountId format' 
+            });
+        }
+
+        if (!require('mongoose').Types.ObjectId.isValid(clientId)) {
+            console.error('❌ [Incoming Message] Invalid clientId format:', clientId);
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Invalid clientId format' 
+            });
+        }
+
+        // CRITICAL: Verify client belongs to account
+        // This prevents users from accessing other accounts' clients
         const client = await Client.findOne({ 
             _id: clientId, 
             userId: accountId 
         });
 
         if (!client) {
+            const securityAudit = require('../middleware/securityAudit');
+            securityAudit.logCrossAccountAccess(
+                req.path,
+                accountId,
+                null,
+                'Client',
+                clientId
+            );
             console.error('❌ [Incoming Message] Client not found:', { clientId, accountId });
             return res.status(404).json({ success: false, message: 'Client not found' });
         }
@@ -223,7 +252,8 @@ const handleIncomingMessage = async (req, res) => {
                 throw new Error('OpenAI API key not configured. Please set OPENAI_API_KEY in backend .env file.');
             }
             
-            replyText = await generateAIReply(clientId, incomingText, senderName);
+            // CRITICAL: Pass accountId to AI service for validation
+            replyText = await generateAIReply(clientId, incomingText, senderName, accountId);
             
             if (!replyText || replyText.length === 0) {
                 throw new Error('AI reply generation returned empty response');
@@ -279,9 +309,10 @@ const handleIncomingMessage = async (req, res) => {
         // Handle duplicate key error (idempotency)
         if (error.code === 11000) {
             // CRITICAL: Verify message belongs to the same account
+            const accountId = req.verifiedAccountId || req.validatedAccountId || req.body.accountId;
             const existingMessage = await Message.findOne({ 
                 idempotencyKey: req.body.idempotencyKey,
-                accountId: req.body.accountId  // Ensure message belongs to this account
+                accountId: accountId  // Ensure message belongs to this account
             });
             if (existingMessage) {
                 return res.json({
@@ -375,10 +406,11 @@ const processPendingMessages = async (req, res) => {
             });
         }
 
-        // Find all messages that haven't been replied to yet
+        // CRITICAL: Find all messages that haven't been replied to yet
+        // Must filter by both clientId AND accountId to prevent cross-account access
         const pendingMessages = await Message.find({
             clientId: client._id,
-            accountId: accountId,
+            accountId: accountId, // CRITICAL: Ensure messages belong to this account
             $or: [
                 { replyStatus: 'none' },
                 { replyStatus: 'queued' },
@@ -402,9 +434,9 @@ const processPendingMessages = async (req, res) => {
         // Process each pending message
         for (const message of pendingMessages) {
             try {
-                // Generate AI reply
+                // CRITICAL: Generate AI reply with accountId validation
                 console.log(`🤖 [Process Pending] Generating reply for message from ${message.senderName}`);
-                const replyText = await generateAIReply(clientId, message.incomingText, message.senderName);
+                const replyText = await generateAIReply(clientId, message.incomingText, message.senderName, accountId);
                 
                 // Update message
                 message.replyText = replyText;

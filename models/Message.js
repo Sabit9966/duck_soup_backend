@@ -44,7 +44,6 @@ const messageSchema = new mongoose.Schema({
     idempotencyKey: {
         type: String,
         required: true,
-        unique: true,
         index: true
     }
 }, {
@@ -54,6 +53,8 @@ const messageSchema = new mongoose.Schema({
 // Compound index for efficient querying
 messageSchema.index({ accountId: 1, replyStatus: 1 });
 messageSchema.index({ clientId: 1, replyStatus: 1 });
+// CRITICAL: Make idempotencyKey unique per account to prevent cross-account collisions
+messageSchema.index({ accountId: 1, idempotencyKey: 1 }, { unique: true });
 
 module.exports = mongoose.model('Message', messageSchema);
 

@@ -21,14 +21,30 @@ if (process.env.GEMINI_API_KEY) {
  * @param {String} clientId - Client ID
  * @param {String} incomingMessage - Incoming message text
  * @param {String} senderName - Sender's name
+ * @param {String} accountId - Account ID (optional, for validation)
  * @returns {Promise<String>} Generated reply text
  */
-const generateReply = async (clientId, incomingMessage, senderName) => {
+const generateReply = async (clientId, incomingMessage, senderName, accountId = null) => {
     try {
-        const client = await Client.findById(clientId);
+        // CRITICAL: If accountId provided, verify client belongs to account
+        const query = accountId 
+            ? { _id: clientId, userId: accountId }
+            : { _id: clientId };
+        
+        const client = await Client.findOne(query);
         
         if (!client) {
             throw new Error('Client not found');
+        }
+
+        // CRITICAL: If accountId provided but doesn't match, this is a security violation
+        if (accountId && client.userId.toString() !== accountId.toString()) {
+            console.error('❌ [AI Service] SECURITY VIOLATION: Client does not belong to account:', {
+                clientId,
+                clientUserId: client.userId,
+                requestedAccountId: accountId
+            });
+            throw new Error('Unauthorized: Client does not belong to this account');
         }
 
         if (!client.aiActive) {

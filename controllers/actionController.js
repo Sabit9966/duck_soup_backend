@@ -14,12 +14,14 @@ const STALE_LOCK_THRESHOLD = 5 * 60 * 1000; // 5 minutes
  */
 const getPendingActions = async (req, res) => {
     try {
-        const { accountId } = req.query;
+        // CRITICAL: Use validated accountId from middleware
+        const accountId = req.verifiedAccountId || req.validatedAccountId || req.query.accountId;
         const extensionInstanceId = req.headers['x-extension-instance-id'] || `ext_${Date.now()}`;
 
         console.log('📋 [Pending Actions] Request received:', {
             accountId,
-            extensionInstanceId: extensionInstanceId.substring(0, 20) + '...'
+            extensionInstanceId: extensionInstanceId.substring(0, 20) + '...',
+            validated: !!req.verifiedAccountId
         });
 
         if (!accountId) {
@@ -27,6 +29,15 @@ const getPendingActions = async (req, res) => {
             return res.status(400).json({ 
                 success: false, 
                 message: 'accountId query parameter is required' 
+            });
+        }
+
+        // CRITICAL: Validate ObjectId format to prevent injection
+        if (!require('mongoose').Types.ObjectId.isValid(accountId)) {
+            console.error('❌ [Pending Actions] Invalid accountId format:', accountId);
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Invalid accountId format' 
             });
         }
 
@@ -109,8 +120,8 @@ const completeAction = async (req, res) => {
         });
 
         // CRITICAL: Verify action belongs to the account making the request
-        // Get accountId from query parameter (sent by extension)
-        const { accountId } = req.query;
+        // Use validated accountId from middleware
+        const accountId = req.verifiedAccountId || req.validatedAccountId || req.query.accountId;
         
         if (!accountId) {
             console.error('❌ [Complete Action] Missing accountId parameter');
@@ -120,13 +131,44 @@ const completeAction = async (req, res) => {
             });
         }
 
+        // CRITICAL: Validate ObjectId format to prevent injection
+        if (!require('mongoose').Types.ObjectId.isValid(accountId)) {
+            console.error('❌ [Complete Action] Invalid accountId format:', accountId);
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Invalid accountId format' 
+            });
+        }
+
+        // CRITICAL: Validate actionId format
+        if (!require('mongoose').Types.ObjectId.isValid(id)) {
+            console.error('❌ [Complete Action] Invalid actionId format:', id);
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Invalid actionId format' 
+            });
+        }
+
+        // CRITICAL: Find action AND verify it belongs to the account
         const action = await Action.findOne({ 
             _id: id,
             accountId: accountId 
         });
 
         if (!action) {
-            console.error('❌ [Complete Action] Action not found or does not belong to account:', { actionId: id, accountId });
+            const securityAudit = require('../middleware/securityAudit');
+            securityAudit.logCrossAccountAccess(
+                req.path,
+                accountId,
+                null,
+                'Action',
+                id
+            );
+            console.error('❌ [Complete Action] Action not found or does not belong to account:', { 
+                actionId: id, 
+                accountId,
+                attemptedAccess: true 
+            });
             return res.status(404).json({ 
                 success: false, 
                 message: 'Action not found' 
@@ -141,12 +183,14 @@ const completeAction = async (req, res) => {
             action.lockOwner = null;
             await action.save();
 
-            // Update message status if this is a sendMessage action
+            // CRITICAL: Update message status if this is a sendMessage action
+            // Must include accountId to prevent cross-account updates
             if (action.type === 'sendMessage' && action.payload.conversationId) {
                 await Message.updateMany(
                     { 
                         conversationId: action.payload.conversationId,
                         clientId: action.clientId,
+                        accountId: accountId, // CRITICAL: Ensure message belongs to this account
                         replyStatus: 'queued'
                     },
                     { replyStatus: 'sent' }
@@ -177,12 +221,14 @@ const completeAction = async (req, res) => {
                 action.lockedAt = null;
                 action.lockOwner = null;
 
-                // Update message status
+                // CRITICAL: Update message status
+                // Must include accountId to prevent cross-account updates
                 if (action.type === 'sendMessage' && action.payload.conversationId) {
                     await Message.updateMany(
                         { 
                             conversationId: action.payload.conversationId,
                             clientId: action.clientId,
+                            accountId: accountId, // CRITICAL: Ensure message belongs to this account
                             replyStatus: 'queued'
                         },
                         { replyStatus: 'failed' }

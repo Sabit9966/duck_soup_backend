@@ -1,5 +1,7 @@
 const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 const User = require('../models/User');
+const securityAudit = require('./securityAudit');
 
 const protect = async (req, res, next) => {
     let token;
@@ -77,4 +79,83 @@ const verifyExtensionKey = (req, res, next) => {
     next();
 };
 
-module.exports = { protect, verifyExtensionKey };
+/**
+ * Middleware to validate accountId for extension endpoints
+ * Ensures accountId is provided and is a valid ObjectId
+ * Note: This does NOT verify ownership - that must be done in controllers
+ */
+const validateAccountId = (req, res, next) => {
+    const accountId = req.query.accountId || req.body.accountId;
+    
+    if (!accountId) {
+        console.error('❌ [Account Validation] Missing accountId');
+        return res.status(400).json({ 
+            success: false, 
+            message: 'accountId is required' 
+        });
+    }
+
+    // Validate ObjectId format
+    if (!mongoose.Types.ObjectId.isValid(accountId)) {
+        securityAudit.logInvalidAccountId(req.path, accountId, req.query.accountId ? 'query' : 'body');
+        console.error('❌ [Account Validation] Invalid accountId format:', accountId);
+        return res.status(400).json({ 
+            success: false, 
+            message: 'Invalid accountId format' 
+        });
+    }
+
+    // Store validated accountId for use in controllers
+    req.validatedAccountId = accountId;
+    next();
+};
+
+/**
+ * Middleware to verify accountId ownership for extension endpoints
+ * Verifies that the accountId belongs to an active user account
+ */
+const verifyAccountOwnership = async (req, res, next) => {
+    try {
+        const accountId = req.validatedAccountId || req.query.accountId || req.body.accountId;
+        
+        if (!accountId) {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'accountId is required' 
+            });
+        }
+
+        // Verify account exists and is active
+        const account = await User.findById(accountId).select('accountStatus');
+        
+        if (!account) {
+            securityAudit.logUnauthorizedAccess(req.path, accountId, 'Account not found');
+            console.error('❌ [Account Ownership] Account not found:', accountId);
+            return res.status(404).json({ 
+                success: false, 
+                message: 'Account not found' 
+            });
+        }
+
+        if (account.accountStatus !== 'active') {
+            securityAudit.logUnauthorizedAccess(req.path, accountId, 'Account not active');
+            console.error('❌ [Account Ownership] Account not active:', accountId);
+            return res.status(403).json({ 
+                success: false, 
+                message: 'Account is not active' 
+            });
+        }
+
+        // Store verified accountId
+        req.verifiedAccountId = accountId;
+        next();
+    } catch (error) {
+        console.error('❌ [Account Ownership] Verification error:', error);
+        return res.status(500).json({ 
+            success: false, 
+            message: 'Account verification failed' 
+        });
+    }
+};
+
+module.exports = { protect, verifyExtensionKey, validateAccountId, verifyAccountOwnership };
